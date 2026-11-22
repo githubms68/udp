@@ -1,1 +1,424 @@
+# SPDX-FileCopyrightText: 2026 Rime community
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# 「同文输入法大海版」——完整编译（含 native），产出 APK。
+#
+# ═══════════════════════════════════════════════════════════════
+# 本版 = 「严谨校验（r25 起的三道保险）」+ 「native 加速（prebuilt 复用）」
+#
+# r25 的校验（保留）：
+#   1. apply 前先 `git apply --check`，失败立刻停（不再静默跳过 hunk）；
+#   2. apply 后校验补丁是否真的落地（关键字符串 + 未转义撇号扫描）；
+#   3. 编译前清掉 app/build 等残留产物，避免增量资源合并复用旧内容。
+#
+# native 加速（本次恢复）：
+#   上游 build-logic 的逻辑是：
+#       if (target.file("prebuilt").exists())
+#           jniLibs.srcDirs = {"prebuilt"}      ← 完全不配置 CMake
+#       else
+#           externalNativeBuild { cmake { ... } }
+#   也就是说 **只要 app/prebuilt/ 存在，NDK 编译整个跳过**。
+#   所以这里：缓存 app/prebuilt → 命中就跳过 NDK；首次编译后再收集 .so 存进去。
+#
+#   缓存 key 说明（native 源码不变就永远命中）：
+#     - dahi-prebuilt-v2 : 各 ABI 的 .so。改了 jni/ 下任何 C/C++ 或升级 librime 版本时 +1
+#     - dahi-deps-v1     : 11 个 submodule 源码。升级 trime 版本或 submodule 版本时 +1
+#   缓存有效期 7 天（GitHub 规则：7 天未访问自动清除），所以别隔太久不跑。
+# ═══════════════════════════════════════════════════════════════
+#
+# 用途：本文件放在**公开**的 CI 仓库里（只放补丁 / check_static.py / workflow）。
+#   与私有版的两点区别：
+#     1. 产物走 Actions artifact，**不建 Release**，保留 1 天；
+#     2. 补丁以**加密**形式存放（dahi.patch.enc + Secret PATCH_KEY），
+#        公开页面/历史里只有密文，看不到补丁内容。
+#        （没配 PATCH_KEY、或直接放明文 dahi.patch 时自动跳过解密，行为与老版一致）
+#
+# 签名（重要）：
+#   - 若仓库配置了 Secrets（SIGNING_KEY / KEY_STORE_PASSWORD / KEY_PASSWORD / ALIAS），
+#     **优先使用既有密钥签名** —— 新包与以前签发的安装包同签名，可直接覆盖升级。
+#   - 若未配置，则退回「构建时生成的临时自签名密钥」，仅供自测，无法覆盖升级旧版。
 
+name: Build Dahi Trime APK
+
+on:
+  # 只在手动点按钮、或打 v* 标签时构建。
+  # （原来这里是 push: branches:[main]：公开仓库里每次 push 都会跑一次完整构建，
+  #   虽然有 prebuilt 缓存只要十几分钟，但没必要为一行文档白跑一次。）
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+# 不再建 Release，也就不需要写权限：只读即可（最小权限）。
+permissions:
+  contents: read
+
+# 关键：设置 CI_NAME 后，app/build.gradle.kts 里的 `project.builder` 就不会去执行
+# `git config user.name`（CI 机器未配置 git 用户名时该命令返回非 0，会让构建失败）。
+env:
+  CI_NAME: Dahi Build
+  DAHI_PREBUILT_KEY: dahi-prebuilt-v2
+  DAHI_DEPS_KEY: dahi-deps-v1
+  GRADLE_OPTS: >-
+    -Dorg.gradle.caching=true
+    -Dorg.gradle.jvmargs=-Xmx6g
+    -Dorg.gradle.parallel=true
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    steps:
+      - name: 记录开始时间
+        run: echo "DAHI_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: 取出本仓库的补丁与自检脚本
+        uses: actions/checkout@v7
+        with:
+          path: kit
+
+      # 注意：这里**故意不拉子模块**。
+      # 子模块源码目录随后由缓存恢复；缓存没命中才拉，能省 1~3 分钟。
+      - name: 检出上游同文 v3.3.12（不拉子模块）
+        uses: actions/checkout@v7
+        with:
+          repository: osfans/trime
+          ref: v3.3.12
+          path: trime
+          fetch-depth: 0
+          submodules: false
+
+      # ---- ① 原生依赖源码（缓存没命中才拉）----
+      - name: 恢复原生依赖缓存
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            trime/app/src/main/jni/OpenCC
+            trime/app/src/main/jni/snappy
+            trime/app/src/main/jni/librime
+            trime/app/src/main/jni/librime-lua
+            trime/app/src/main/jni/librime-lua-deps
+            trime/app/src/main/jni/librime-octagram
+            trime/app/src/main/jni/librime-predict
+            trime/app/data/rime/prelude
+            trime/app/data/rime/luna-pinyin
+            trime/app/data/rime/stroke
+            trime/app/data/rime/essay
+          key: ${{ env.DAHI_DEPS_KEY }}
+
+      - name: 补齐缺失的原生依赖
+        working-directory: trime
+        run: |
+          set -euo pipefail
+          if [ -f app/src/main/jni/librime/CMakeLists.txt ] \
+             && [ -d app/src/main/jni/OpenCC/data ] \
+             && [ -d app/data/rime/prelude ]; then
+            echo "✅ 依赖来自缓存，跳过拉取"
+            du -sh app/src/main/jni/librime app/data/rime 2>/dev/null || true
+          else
+            echo "ℹ️ 缓存未命中：拉取子模块（首次约 2~4 分钟）"
+            git submodule update --init --recursive
+          fi
+
+      # ---- 取得补丁（三种来源，自动判断；推荐用第 ① 种）----
+      # ① Secret 里配了 PATCH_TOKEN + PATCH_REPO：
+      #    直接从你的**私有仓库**用 GitHub API 拉最新 dahi.patch。
+      #    公开仓库里连补丁文件都不用放 —— 每轮只在私有仓库 push，这边零操作，
+      #    历史里也不存在任何补丁内容。
+      #    （需 fine-grained PAT：只勾该私有仓库的 Contents: Read）
+      # ② 仓库里放了 dahi.patch.enc：用 Secret PATCH_KEY 解密。
+      #    公开页面/历史里只有密文。
+      # ③ 仓库里直接放了明文 dahi.patch：原样使用（向后兼容）。
+      - name: 取得补丁（私有仓库拉取 / 加密文件 / 明文，自动判断）
+        env:
+          PATCH_TOKEN: ${{ secrets.PATCH_TOKEN }}
+          PATCH_REPO: ${{ secrets.PATCH_REPO }}
+          PATCH_REF: ${{ secrets.PATCH_REF }}
+          PATCH_KEY: ${{ secrets.PATCH_KEY }}
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/kit/dahi.patch"
+          ENC="$GITHUB_WORKSPACE/kit/dahi.patch.enc"
+
+          if [ -n "${PATCH_TOKEN:-}" ] && [ -n "${PATCH_REPO:-}" ]; then
+            REF="${PATCH_REF:-main}"
+            echo ">> 来源 ①：从私有仓库 $PATCH_REPO@$REF 拉取 dahi.patch"
+            curl -fsSL \
+              -H "Authorization: Bearer $PATCH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/$PATCH_REPO/contents/dahi.patch?ref=$REF" \
+              -o "$OUT"
+          elif [ -f "$ENC" ]; then
+            echo ">> 来源 ②：仓库里的 dahi.patch.enc，用 PATCH_KEY 解密"
+            if [ -z "${PATCH_KEY:-}" ]; then
+              echo "::error::有 dahi.patch.enc 但没配 Secret PATCH_KEY —— 无法解密"
+              exit 1
+            fi
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$ENC" -out "$OUT" -pass env:PATCH_KEY
+          else
+            echo ">> 来源 ③：仓库里的明文 dahi.patch"
+          fi
+
+          if [ ! -s "$OUT" ]; then
+            echo "::error::没拿到补丁（三种来源都不可用）"
+            exit 1
+          fi
+          if ! grep -q "DAHI-PATCH-STAMP" "$OUT"; then
+            echo "::error::拿到的不是补丁（可能 PAT 权限不对 / 密钥不对 / 分支名不对）"
+            exit 1
+          fi
+          echo "✅ 补丁就绪：$(wc -c < "$OUT") 字节"
+          grep -a "轮次" "$OUT" | head -1 || true
+
+      - name: 应用「大海版」补丁（先 check 再 apply，失败立刻停）
+        working-directory: trime
+        run: |
+          set -euo pipefail
+          P="$GITHUB_WORKSPACE/kit/dahi.patch"
+          echo "== 补丁文件 =="
+          ls -l "$P"
+          sha256sum "$P"
+
+          echo "== git status（干净树应该没有任何输出）=="
+          git status --short || true
+
+          if ! git apply --check --whitespace=nowarn "$P"; then
+            echo "::error::补丁和当前树对不上 —— 树不是干净的 v3.3.12（或被别的东西改过）。"
+            git status --short || true
+            exit 1
+          fi
+          git apply --whitespace=nowarn "$P"
+          git config user.name "Dahi CI"
+          git config user.email "ci@dahi.local"
+
+          echo "== 补丁落地校验 =="
+          grep -n "dahi_backup_remind_test_done" \
+            app/src/main/res/values/strings_dahi_upgrade.xml
+          grep -n "dahi_phrase_import_file_desc" \
+            app/src/main/res/values/strings_dahi_custom.xml
+          if grep -rn "don't" app/src/main/res/ || grep -rn "Rime's" app/src/main/res/; then
+            echo "::error::strings 里还有未转义的单引号，AAPT 会失败（补丁没打完整？）"
+            exit 1
+          fi
+          echo "（未转义撇号：无，正常）"
+          echo "== 补丁版本戳 =="
+          head -4 DAHI-PATCH-STAMP.txt
+
+      - name: 准备静态自检脚本（仓库里没放就从私有仓库拉）
+        env:
+          PATCH_TOKEN: ${{ secrets.PATCH_TOKEN }}
+          PATCH_REPO: ${{ secrets.PATCH_REPO }}
+          PATCH_REF: ${{ secrets.PATCH_REF }}
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/kit/check_static.py"
+          if [ -f "$OUT" ]; then
+            echo "✅ 用仓库里的 check_static.py"
+            exit 0
+          fi
+          if [ -z "${PATCH_TOKEN:-}" ] || [ -z "${PATCH_REPO:-}" ]; then
+            echo "ℹ️ 仓库里没有 check_static.py，也没配 PATCH_TOKEN —— 跳过静态自检"
+            exit 0
+          fi
+          REF="${PATCH_REF:-main}"
+          curl -fsSL \
+            -H "Authorization: Bearer $PATCH_TOKEN" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/$PATCH_REPO/contents/check_static.py?ref=$REF" \
+            -o "$OUT"
+          echo "✅ 已从私有仓库取到 check_static.py（$(wc -c < "$OUT") 字节）"
+
+      - name: 资源静态自检（会自动修好裸撇号，并做补丁完整性体检）
+        run: |
+          S="$GITHUB_WORKSPACE/kit/check_static.py"
+          if [ -f "$S" ]; then
+            python3 "$S" trime
+          else
+            echo "::notice::没有 check_static.py，跳过静态自检（建议把脚本一起放上来）"
+          fi
+
+      # ---- ② 预编译 native 库（命中就完全跳过 NDK）----
+      - name: 尝试恢复预编译 native 库
+        id: prebuilt
+        uses: actions/cache@v4
+        with:
+          path: trime/app/prebuilt
+          key: ${{ env.DAHI_PREBUILT_KEY }}
+
+      - name: 判断是否需要编译 native
+        id: neednative
+        run: |
+          if find trime/app/prebuilt -name "*.so" 2>/dev/null | head -1 | grep -q .; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 命中预编译库，本次跳过 NDK 编译"
+            du -sh trime/app/prebuilt || true
+            ls -1 trime/app/prebuilt || true
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ 没有预编译库：本次会完整编译 native，并把结果存起来供后续复用"
+          fi
+
+      # 前置检查：把「缺目录」变成一条能看懂的报错，
+      # 而不是等 Gradle 在 installOpenCCData 里抛 inputDir ... does not exist
+      - name: 构建前置检查（依赖目录完整性）
+        run: |
+          set -e
+          missing=0
+          check() {
+            if [ ! -e "trime/$1" ]; then
+              echo "::error::缺少 $1 —— 原生依赖没准备好（$2）"
+              missing=1
+            fi
+          }
+          check app/src/main/jni/OpenCC/data "OpenCC 词典数据，installOpenCCData 需要"
+          check app/src/main/jni/librime/CMakeLists.txt "librime 源码"
+          check app/data/rime/prelude "内置方案数据"
+          [ "$missing" = "0" ] || exit 1
+          echo "✅ 依赖目录完整"
+
+      # ---- ③ 工具链 ----
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: gradle
+
+      - name: 恢复 Android SDK 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/android/sdk/platforms
+            /usr/local/lib/android/sdk/build-tools
+            /usr/local/lib/android/sdk/cmake
+            /usr/local/lib/android/sdk/ndk
+            ~/.android
+          key: dahi-android-sdk-v1
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      # 命中 prebuilt 时不需要 CMake，跳过安装能省 30~60 秒
+      - name: Install CMake
+        if: steps.neednative.outputs.hit != 'true'
+        run: sdkmanager --install "cmake;3.31.6"
+
+      # 注意：不删全局 build cache（那会让 librime 全部重编）；
+      # 也不动 app/prebuilt（那是跳过 NDK 的唯一依据）。
+      - name: 清掉项目内的残留产物
+        working-directory: trime
+        run: |
+          rm -rf app/build build-logic/build .gradle
+          echo "已清理：app/build build-logic/build .gradle"
+          if [ -d app/prebuilt ]; then echo "app/prebuilt 保留（用于跳过 NDK）"; fi
+
+      - name: 准备签名密钥
+        working-directory: trime
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+        run: |
+          if [ -n "${SIGNING_KEY:-}" ]; then
+            echo ">> 检测到 SIGNING_KEY：使用你既有的正式密钥签名（与旧安装包同签名，可覆盖升级）。"
+            printf '%s' "$SIGNING_KEY" | base64 -d > dahi.keystore
+            # 自检：密码不对会在这里立刻报错，而不是等到 packageRelease 才失败
+            # 校验密钥（能列出条目即密码/别名正确）。
+            # 输出丢弃：这是公开仓库，日志公开可看，没必要把别名/证书指纹打出来。
+            if keytool -list -keystore dahi.keystore -storepass "$KEY_STORE_PASSWORD" >/dev/null 2>&1; then
+              echo "✅ 密钥可用（密码 / 别名正确）"
+            else
+              echo "::error::keystore 打不开：请检查 SIGNING_KEY / KEY_STORE_PASSWORD / ALIAS 三个 Secret"
+              exit 1
+            fi
+            {
+              echo "storePassword=$KEY_STORE_PASSWORD"
+              echo "keyPassword=${KEY_PASSWORD:-$KEY_STORE_PASSWORD}"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "storeFile=$PWD/dahi.keystore"
+            } > keystore.properties
+          else
+            echo ">> 未配置 SIGNING_KEY：退回一次性自签名密钥（仅供自测，无法覆盖升级已装旧版）。"
+            keytool -genkeypair -v -keystore dahi.keystore -alias dahi \
+              -keyalg RSA -keysize 2048 -validity 10000 -storetype PKCS12 \
+              -storepass dahipass -keypass dahipass \
+              -dname "CN=Dahi Trime, OU=Dahi, O=Dahi, L=City, ST=State, C=CN"
+            {
+              echo "storePassword=dahipass"
+              echo "keyPassword=dahipass"
+              echo "keyAlias=dahi"
+              echo "storeFile=$PWD/dahi.keystore"
+            } > keystore.properties
+          fi
+          echo "== keystore.properties（已脱敏）=="
+          sed -e 's/^storePassword=.*/storePassword=***/' -e 's/^keyPassword=.*/keyPassword=***/' keystore.properties
+
+      - name: 编译（make release）
+        working-directory: trime
+        run: |
+          T0=$(date +%s)
+          make release
+          echo "⏱ 编译耗时 $(( $(date +%s) - T0 )) 秒"
+
+      # ---- ④ 本次编了 native 的话，把 .so 收进 app/prebuilt 供后续复用 ----
+      - name: 生成预编译 native 库（仅在本次编了 native 时）
+        if: steps.neednative.outputs.hit != 'true'
+        working-directory: trime
+        run: |
+          set -e
+          mkdir -p app/prebuilt
+          found=0
+          while IFS= read -r so; do
+            abi=$(basename "$(dirname "$so")")
+            mkdir -p "app/prebuilt/$abi"
+            cp -f "$so" "app/prebuilt/$abi/"
+            found=$((found + 1))
+          done < <(find app/build/intermediates/stripped_native_libs -type f -name "*.so")
+          echo ">> 收集到 $found 个 .so"
+          ls -1 app/prebuilt || true
+          du -sh app/prebuilt || true
+          if [ "$found" -lt 4 ]; then
+            echo "::warning::收集到的 .so 偏少，可能没有覆盖全部 ABI；下次仍会尝试编译 native"
+            rm -rf app/prebuilt
+          fi
+
+      # ---- ⑤ 上传 APK 作为 Actions 产物（**不建 Release**）----
+      # 这个仓库是**公开**的，所以产物出口必须换掉：
+      #   · 绝不建 Release —— Release 是公开页面，任何人（甚至无需登录、搜索引擎
+      #     和镜像站也能索引）都能看到并直接下载 APK，等于把包发到全网；
+      #   · 改用 Actions artifact —— 入口跟这次 run 绑定，只有点进这一页才能下载，
+      #     保留 1 天自动销毁，把这个 run 删掉则日志和产物一起消失，仓库里不留痕；
+      #   · 公开仓库的 artifact 存储是免费的（私有仓库才有 500 MB 总配额限制）。
+      - name: 上传 APK（Actions 产物，保留 1 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: dahi-apk-${{ github.run_number }}
+          path: trime/app/build/outputs/apk/release/*.apk
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: 运行页摘要（下载位置）
+        run: |
+          {
+            echo "## 构建成功"
+            echo ""
+            echo "APK 在**本次运行页面最底部**的 **Artifacts** 区域，名字是"
+            echo "`dahi-apk-${{ github.run_number }}`（点开就能下载，压缩包内含各 ABI 的 APK）。"
+            echo ""
+            echo "> 产物只保留 **1 天**；下载完可以直接把这个 run 删掉"
+            echo "> （run 页面右上 `...` → *Delete workflow run*），日志和产物会一起消失。"
+            echo ">"
+            echo "> 本仓库是公开的，所以**不建 Release**：Release 是公开页面，"
+            echo "> 会被搜索引擎和镜像站抓到，等于把安装包发到全网。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: 汇总耗时
+        if: always()
+        run: |
+          echo "⏱ 全流程耗时 $(( $(date +%s) - DAHI_START )) 秒"
+          echo "- 依赖缓存：${{ steps.deps.outputs.cache-hit == 'true' && '命中' || '未命中（本次已重建）' }}"
+          echo "- native 编译：${{ steps.neednative.outputs.hit == 'true' && '跳过（命中 prebuilt）' || '本次执行（已生成 prebuilt）' }}"
