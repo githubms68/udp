@@ -34,6 +34,8 @@
 #        其次是仓库里的 dahi.patch.enc（加密），最后才是明文 dahi.patch。
 #   内置了「Kotlin 快速门禁」：打包前先单独编一遍 Release Kotlin，
 #   Kotlin/资源类错误 3~6 分钟暴露，不需要另建 fast check 工作流。
+#   门禁前会先修 git 环境（子模块 describe），否则 Gradle 配置阶段会因
+#   `Process 'command 'git'' finished with non-zero exit value 128` 直接失败。
 #
 # 签名（重要）：
 #   - 若仓库配置了 Secrets（SIGNING_KEY / KEY_STORE_PASSWORD / KEY_PASSWORD / ALIAS），
@@ -321,6 +323,34 @@ jobs:
       # 这一步跳过 native、只编 Kotlin：3~6 分钟就能把这类错误指出来，
       # 不必再单独维护一个 fast check 工作流。
       # 代价≈0：这里编出来的产物后面 `make release` 会直接命中，不会重复编译。
+      # ---- 修 git 环境：Gradle 配置阶段会跑 `git -C app/src/main/jni/librime describe` ----
+      # 子模块如果是从 CI 缓存恢复的，里面的 .git 只是个指针，指向 trime/.git/modules/...，
+      # 而新的 checkout 根本没有那个 gitdir → describe 以 128 退出 →
+      # 上游 build-logic 的 providers.exec 直接抛异常，整个配置阶段挂掉（与补丁无关）。
+      # 这里先修 safe.directory，再逐个确认子模块是真仓库，不行的重建。
+      - name: 修 git 环境（子模块 describe 可用）
+        working-directory: trime
+        run: |
+          set -uo pipefail
+          git config --global --add safe.directory "*" || true
+          bad=0
+          for d in app/src/main/jni/librime app/src/main/jni/OpenCC \
+                   app/src/main/jni/librime-lua app/src/main/jni/librime-lua-deps \
+                   app/src/main/jni/librime-octagram app/src/main/jni/librime-predict \
+                   app/src/main/jni/snappy; do
+            [ -d "$d" ] || continue
+            if git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+              echo "✅ $d : $(git -C "$d" describe --tags --long --always 2>/dev/null | head -1)"
+            else
+              bad=$((bad + 1))
+              echo "::warning::$d 的 .git 无效（常见于从缓存恢复），重建"
+              rm -rf "$d"
+              git submodule update --init --recursive -- "$d" || true
+              echo "   重建后：$(git -C "$d" describe --tags --long --always 2>/dev/null | head -1 || echo '仍不可用（不致命，版本号会留空）')"
+            fi
+          done
+          echo "需要重建的子模块：$bad 个"
+
       - name: Kotlin 快速门禁（先编 Kotlin，错误 3 分钟内暴露）
         working-directory: trime
         run: |
