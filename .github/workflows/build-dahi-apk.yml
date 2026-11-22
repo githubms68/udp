@@ -30,9 +30,10 @@
 # 用途：本文件放在**公开**的 CI 仓库里（只放补丁 / check_static.py / workflow）。
 #   与私有版的两点区别：
 #     1. 产物走 Actions artifact，**不建 Release**，保留 1 天；
-#     2. 补丁以**加密**形式存放（dahi.patch.enc + Secret PATCH_KEY），
-#        公开页面/历史里只有密文，看不到补丁内容。
-#        （没配 PATCH_KEY、或直接放明文 dahi.patch 时自动跳过解密，行为与老版一致）
+#     2. 补丁不落在公开仓库里：优先用 Secret 里的 PAT 从私有仓库拉，
+#        其次是仓库里的 dahi.patch.enc（加密），最后才是明文 dahi.patch。
+#   内置了「Kotlin 快速门禁」：打包前先单独编一遍 Release Kotlin，
+#   Kotlin/资源类错误 3~6 分钟暴露，不需要另建 fast check 工作流。
 #
 # 签名（重要）：
 #   - 若仓库配置了 Secrets（SIGNING_KEY / KEY_STORE_PASSWORD / KEY_PASSWORD / ALIAS），
@@ -313,6 +314,19 @@ jobs:
           rm -rf app/build build-logic/build .gradle
           echo "已清理：app/build build-logic/build .gradle"
           if [ -d app/prebuilt ]; then echo "app/prebuilt 保留（用于跳过 NDK）"; fi
+
+      # ---- 内置「快速门禁」：先单独编一遍 Release Kotlin，再走完整打包 ----
+      # 完整 `make release` 在**冷缓存**时要先把 4 个 ABI 的 librime 编一遍（25~35 分钟），
+      # 而绝大多数失败是 Kotlin 层的低级错误（漏 import、漏 <string>、类型推断错）。
+      # 这一步跳过 native、只编 Kotlin：3~6 分钟就能把这类错误指出来，
+      # 不必再单独维护一个 fast check 工作流。
+      # 代价≈0：这里编出来的产物后面 `make release` 会直接命中，不会重复编译。
+      - name: Kotlin 快速门禁（先编 Kotlin，错误 3 分钟内暴露）
+        working-directory: trime
+        run: |
+          T0=$(date +%s)
+          ./gradlew :app:compileReleaseKotlin --no-daemon --console=plain --stacktrace
+          echo "⏱ Kotlin 门禁耗时 $(( $(date +%s) - T0 )) 秒 —— 通过，继续完整打包"
 
       - name: 准备签名密钥
         working-directory: trime
