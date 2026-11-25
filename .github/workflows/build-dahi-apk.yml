@@ -168,8 +168,12 @@ jobs:
             echo "::error::没拿到补丁（三种来源都不可用）"
             exit 1
           fi
-          if ! grep -q "DAHI-PATCH-STAMP" "$OUT"; then
+          # 判据用「补丁本身的样子」：git 补丁一定以 diff --git 开头。
+          # 以前这里查的是 DAHI-PATCH-STAMP 那行内部戳，后来补丁不再带它（免得每次字节都不同），
+          # 于是出现了「明明是正确的补丁，却被判成不是补丁」。
+          if ! grep -q "^diff --git" "$OUT"; then
             echo "::error::拿到的不是补丁（可能 PAT 权限不对 / 密钥不对 / 分支名不对）"
+            head -c 300 "$OUT" || true
             exit 1
           fi
           echo "✅ 补丁就绪：$(wc -c < "$OUT") 字节"
@@ -207,7 +211,11 @@ jobs:
           fi
           echo "（未转义撇号：无，正常）"
           echo "== 补丁版本戳 =="
-          head -4 DAHI-PATCH-STAMP.txt
+          if [ -f DAHI-PATCH-STAMP.txt ]; then
+            head -4 DAHI-PATCH-STAMP.txt
+          else
+            echo "（这个补丁没带 DAHI-PATCH-STAMP.txt，跳过版本戳）"
+          fi
 
       - name: 准备静态自检脚本（仓库里没放就从私有仓库拉）
         env:
