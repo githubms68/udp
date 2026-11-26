@@ -261,11 +261,25 @@ jobs:
       - name: 判断是否需要编译 native
         id: neednative
         run: |
+          # 只按「有没有 .so」判断会让 C++ 改动永远不生效：预编译库一旦缓存，
+          # 之后改了 jni 源码也照样跳过 NDK 编译，APK 里仍是旧的 librime_jni.so。
+          # （真实事故：把前端自报名称改成随版本线生成的 V6，用户装上新包仍显示 V1。）
+          # 所以给全部 C/C++ 源文件算一个指纹，指纹不一致就强制重编。
+          SRCHASH=$(cd trime && find app/src/main/jni -type f \( -name "*.cc" -o -name "*.c" -o -name "*.h" -o -name "*.hpp" -o -name "CMakeLists.txt" -o -name "*.cmake" \) -print0 2>/dev/null | sort -z | xargs -0 cat 2>/dev/null | sha256sum | cut -d" " -f1)
+          echo "C++ 源文件指纹：$SRCHASH"
+          echo "src_hash=$SRCHASH" >> "$GITHUB_OUTPUT"
           if find trime/app/prebuilt -name "*.so" 2>/dev/null | head -1 | grep -q .; then
-            echo "hit=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 命中预编译库，本次跳过 NDK 编译"
-            du -sh trime/app/prebuilt || true
-            ls -1 trime/app/prebuilt || true
+            OLD=$(cat trime/app/prebuilt/.src-hash 2>/dev/null || echo none)
+            echo "预编译库指纹：$OLD"
+            if [ "$OLD" = "$SRCHASH" ]; then
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+              echo "✅ 命中预编译库（jni 源码未变），本次跳过 NDK 编译"
+              du -sh trime/app/prebuilt || true
+            else
+              echo "hit=false" >> "$GITHUB_OUTPUT"
+              echo "⚠️ jni 源码已变化 → 预编译库过期，强制重编 native"
+              rm -rf trime/app/prebuilt
+            fi
           else
             echo "hit=false" >> "$GITHUB_OUTPUT"
             echo "ℹ️ 没有预编译库：本次会完整编译 native，并把结果存起来供后续复用"
@@ -429,6 +443,8 @@ jobs:
             cp -f "$so" "app/prebuilt/$abi/"
             found=$((found + 1))
           done < <(find app/build/intermediates/stripped_native_libs -type f -name "*.so")
+          echo "${{ steps.neednative.outputs.src_hash }}" > app/prebuilt/.src-hash
+          echo ">> 已记录 jni 源码指纹（下次据此判断是否需要重编）"
           echo ">> 收集到 $found 个 .so"
           ls -1 app/prebuilt || true
           du -sh app/prebuilt || true
