@@ -475,10 +475,13 @@ jobs:
       - name: 整理产物（plain 全 ABI + plus 只留 arm64）
         working-directory: trime
         run: |
-          ls -1 app/build/outputs/apk/release/ || true
-          find app/build/outputs/apk/release -maxdepth 1 -name "*.apk" ! -name "*plain*" ! -name "*arm64*" -delete || true
-          echo "== 最终产物 =="
-          ls -lh app/build/outputs/apk/release/ || true
+          echo "== 打包产出的全部 APK =="
+          find app/build/outputs/apk/release -name "*.apk" | sort || true
+          # 加了 flavor 后 APK 在 release/<flavor>/ 子目录里，不能只看第一层。
+          # plus 只保留 arm64：其它 ABI 里没有 sherpa 的 .so，是空壳包。
+          find app/build/outputs/apk/release -name "*.apk" -path "*plus*" ! -name "*arm64*" -delete || true
+          echo "== 最终上传的 APK =="
+          find app/build/outputs/apk/release -name "*.apk" -exec ls -lh {} \; || true
 
       # ---- ⑤ 上传 APK 作为 Actions 产物（**不建 Release**）----
       # 这个仓库是**公开**的，所以产物出口必须换掉：
@@ -491,7 +494,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dahi-apk-${{ github.run_number }}
-          path: trime/app/build/outputs/apk/release/*.apk
+          path: trime/app/build/outputs/apk/release/**/*.apk
           retention-days: 1
           if-no-files-found: error
 
