@@ -475,13 +475,20 @@ jobs:
       - name: 整理产物（plain 全 ABI + plus 只留 arm64）
         working-directory: trime
         run: |
+          # 有 flavor 时 AGP 的目录是 apk/<flavor>/<buildType>/，没有 flavor 时才是 apk/<buildType>/。
+          # 所以一律从 apk/ 这一层往下找，别假设中间是哪一层。
+          echo "== outputs 目录结构（前 40 行）=="
+          find app/build/outputs -maxdepth 4 -type d | sort | head -40 || true
           echo "== 打包产出的全部 APK =="
-          find app/build/outputs/apk/release -name "*.apk" | sort || true
-          # 加了 flavor 后 APK 在 release/<flavor>/ 子目录里，不能只看第一层。
+          find app/build/outputs/apk -name "*.apk" | sort || true
           # plus 只保留 arm64：其它 ABI 里没有 sherpa 的 .so，是空壳包。
-          find app/build/outputs/apk/release -name "*.apk" -path "*plus*" ! -name "*arm64*" -delete || true
+          find app/build/outputs/apk -name "*.apk" -path "*plus*" ! -name "*arm64*" -delete || true
           echo "== 最终上传的 APK =="
-          find app/build/outputs/apk/release -name "*.apk" -exec ls -lh {} \; || true
+          find app/build/outputs/apk -name "*.apk" -exec ls -lh {} \; || true
+          if [ -z "$(find app/build/outputs/apk -name '*.apk' -print -quit)" ]; then
+            echo "::error::没有任何 APK 产出 —— 先看上面的 outputs 目录结构，确认 assembleRelease 真的跑过"
+            exit 1
+          fi
 
       # ---- ⑤ 上传 APK 作为 Actions 产物（**不建 Release**）----
       # 这个仓库是**公开**的，所以产物出口必须换掉：
@@ -494,7 +501,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dahi-apk-${{ github.run_number }}
-          path: trime/app/build/outputs/apk/release/**/*.apk
+          path: trime/app/build/outputs/apk/**/*.apk
           retention-days: 1
           if-no-files-found: error
 
