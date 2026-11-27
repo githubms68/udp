@@ -377,7 +377,7 @@ jobs:
         working-directory: trime
         run: |
           T0=$(date +%s)
-          ./gradlew :app:compileReleaseKotlin --no-daemon --console=plain --stacktrace
+          ./gradlew :app:compilePlainReleaseKotlin :app:compilePlusReleaseKotlin --no-daemon --console=plain --stacktrace
           echo "⏱ Kotlin 门禁耗时 $(( $(date +%s) - T0 )) 秒 —— 通过，继续完整打包"
 
       - name: 准备签名密钥
@@ -422,6 +422,24 @@ jobs:
           echo "== keystore.properties（已脱敏）=="
           sed -e 's/^storePassword=.*/storePassword=***/' -e 's/^keyPassword=.*/keyPassword=***/' keystore.properties
 
+      # ---- 内置离线引擎的原生库：从官方 AAR 里抽 .so 放进 plus 源集 ----
+      # Kotlin API 源码已经随补丁放在 app/src/plus 里（版本锁死 2.0.1），
+      # 这里只要 .so；只取 arm64-v8a，plus 包也就只出 arm64。
+      - name: 准备内置引擎（sherpa-onnx 原生库，仅 plus / arm64）
+        working-directory: trime
+        run: |
+          set -e
+          AAR=/tmp/sherpa-onnx.aar
+          curl -L --retry 3 --retry-delay 2 -o "$AAR" \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar"
+          ls -lh "$AAR"
+          rm -rf /tmp/sherpa_aar && mkdir -p /tmp/sherpa_aar
+          unzip -oq "$AAR" -d /tmp/sherpa_aar
+          mkdir -p app/src/plus/jniLibs/arm64-v8a
+          cp -f /tmp/sherpa_aar/jni/arm64-v8a/*.so app/src/plus/jniLibs/arm64-v8a/ 2>/dev/null || \
+            find /tmp/sherpa_aar -name "*.so" -exec cp -f {} app/src/plus/jniLibs/arm64-v8a/ \;
+          ls -lh app/src/plus/jniLibs/arm64-v8a
+
       - name: 编译（make release）
         working-directory: trime
         run: |
@@ -452,6 +470,15 @@ jobs:
             echo "::warning::收集到的 .so 偏少，可能没有覆盖全部 ABI；下次仍会尝试编译 native"
             rm -rf app/prebuilt
           fi
+
+      # ---- ④.5 清掉 plus 的非 arm64 空壳包（里面没有 .so，纯属多打）----
+      - name: 整理产物（plain 全 ABI + plus 只留 arm64）
+        working-directory: trime
+        run: |
+          ls -1 app/build/outputs/apk/release/ || true
+          find app/build/outputs/apk/release -maxdepth 1 -name "*.apk" ! -name "*plain*" ! -name "*arm64*" -delete || true
+          echo "== 最终产物 =="
+          ls -lh app/build/outputs/apk/release/ || true
 
       # ---- ⑤ 上传 APK 作为 Actions 产物（**不建 Release**）----
       # 这个仓库是**公开**的，所以产物出口必须换掉：
