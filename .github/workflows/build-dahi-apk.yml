@@ -380,8 +380,14 @@ jobs:
       - name: Kotlin 快速门禁（先编 Kotlin，错误 3 分钟内暴露）
         working-directory: trime
         run: |
+          set -e
           T0=$(date +%s)
-          ./gradlew :app:compilePlainReleaseKotlin :app:compilePlusReleaseKotlin --no-daemon --console=plain --stacktrace
+          # 一次只编一个 flavor：KSP2 在同一次构建里并行跑 kspPlainRelease / kspPlusRelease 时，
+          # 两个任务共用 build/kspCaches，偶发读到对方刚创建还没写完的空 JSON：
+          #   [ksp] JsonDecodingException: Expected start of the object '{', but had 'EOF'  JSON input: （空）
+          # 拆成两次调用后两者不再同时存在，竞态消失（总耗时只多一次配置阶段，约 1 分钟）。
+          ./gradlew :app:compilePlainReleaseKotlin --no-daemon --console=plain --stacktrace
+          ./gradlew :app:compilePlusReleaseKotlin --no-daemon --console=plain --stacktrace
           echo "⏱ Kotlin 门禁耗时 $(( $(date +%s) - T0 )) 秒 —— 通过，继续完整打包"
 
       - name: 准备签名密钥
@@ -447,8 +453,12 @@ jobs:
       - name: 编译（make release）
         working-directory: trime
         run: |
+          set -e
           T0=$(date +%s)
-          make release
+          # 同样按 flavor 分开跑（原因见上面的快速门禁），patch-apply 仍走 make 目标保持一致。
+          make patch-apply
+          ./gradlew :app:assemblePlainRelease --console=plain --stacktrace
+          ./gradlew :app:assemblePlusRelease --console=plain --stacktrace
           echo "⏱ 编译耗时 $(( $(date +%s) - T0 )) 秒"
 
       # ---- ④ 本次编了 native 的话，把 .so 收进 app/prebuilt 供后续复用 ----
