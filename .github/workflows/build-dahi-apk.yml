@@ -335,8 +335,12 @@ jobs:
       - name: 清掉项目内的残留产物
         working-directory: trime
         run: |
-          rm -rf app/build build-logic/build .gradle
-          echo "已清理：app/build build-logic/build .gradle"
+          rm -rf app/build build-logic/build .gradle .kotlin codegen/build
+          echo "已清理：app/build build-logic/build .gradle .kotlin codegen/build"
+          # KSP 的增量/构建缓存有时会恢复出一份空 JSON，导致
+          #   [ksp] JsonDecodingException: Expected start of the object '{', but had 'EOF'
+          # 清掉这一份缓存最省事（只影响本次速度，不影响正确性）。
+          rm -rf ~/.gradle/caches/build-cache-1 || true
           if [ -d app/prebuilt ]; then echo "app/prebuilt 保留（用于跳过 NDK）"; fi
 
       # ---- 内置「快速门禁」：先单独编一遍 Release Kotlin，再走完整打包 ----
@@ -482,7 +486,9 @@ jobs:
           echo "== 打包产出的全部 APK =="
           find app/build/outputs/apk -name "*.apk" | sort || true
           # plus 只保留 arm64：其它 ABI 里没有 sherpa 的 .so，是空壳包。
-          find app/build/outputs/apk -name "*.apk" -path "*plus*" ! -name "*arm64*" -delete || true
+          # 注意：版本号本身是 3.3.12-plus.v6，文件名里天然含 "plus"，
+          # 所以这里只认目录段 /plus/，不能用 -path "*plus*"（会把 plain 包也删掉）。
+          find app/build/outputs/apk -name "*.apk" -path "*/plus/*" ! -name "*arm64*" -delete || true
           echo "== 最终上传的 APK =="
           find app/build/outputs/apk -name "*.apk" -exec ls -lh {} \; || true
           if [ -z "$(find app/build/outputs/apk -name '*.apk' -print -quit)" ]; then
